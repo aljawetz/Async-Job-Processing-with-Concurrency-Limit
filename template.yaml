@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AWS SAM template for async job processing with concurrency limit
+
+Parameters:
+  NumOfConcurrentJobs:
+    Type: Number
+    Description: The number of concurrent executions for the Lambda function.
+    Default: 5
+
+Resources:
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: NONE
+
+  # DynamoDB Table for tracking concurrent jobs
+  JobTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # Lambda function to handle requests and submit jobs
+  RequestHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: request_handler.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./
+      Environment:
+        Variables:
+          JOB_TRACKING_TABLE: !Ref JobTrackingTable
+          JOB_LAMBDA_ARN: !GetAtt JobLambdaFunction.Arn
+          NUM_OF_CONCURRENT_JOBS: !Ref NumOfConcurrentJobs
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTrackingTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref JobLambdaFunction
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /submit-job
+            Method: post
+            RestApiId: !Ref ApiGateway
+
+  # Lambda function for the job (provided in the question)
+  JobLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./
+      Timeout: 900
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref MyEventBus
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt MyEventBus.Arn
+
+  # New Lambda function to handle job completion
+  JobCompletionHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: job_completion_handler.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./
+      Environment:
+        Variables:
+          JOB_TRACKING_TABLE: !Ref JobTrackingTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobTrackingTable
+
+  # EventBridge Event Bus
+  MyEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: MyEventBus
+
+  # SNS Topic for job completion notifications
+  JobCompletionTopic:
+    Type: AWS::SNS::Topic
+
+  # EventBridge Rule to trigger JobCompletionHandler when a job completes
+  JobCompletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref MyEventBus
+      EventPattern:
+        source:
+          - 'my.custom.source'
+        detail-type:
+          - 'LambdaFunctionCompleted'
+      Targets:
+        - Arn: !GetAtt JobCompletionHandler.Arn
+          Id: 'JobCompletionHandler'
+        - Arn: !Ref JobCompletionTopic
+          Id: 'SNSTarget'
+
+  # Permission for EventBridge to invoke JobCompletionHandler
+  JobCompletionHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JobCompletionHandler
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt JobCompletionRule.Arn
+
+  # IAM Role for EventBridge to publish to SNS
+  EventBridgeSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref JobCompletionTopic
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL for Prod stage'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
